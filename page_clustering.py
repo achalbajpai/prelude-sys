@@ -51,10 +51,8 @@ class MedicalRecordPageClustering:
 
     def extract_medical_entities(self, text):
         doc = self.nlp(text)
-
         date_pattern = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
         dates = re.findall(date_pattern, text)
-
         provider_pattern = (
             r"Dr\.\s+[A-Z][a-z]+\s+[A-Z][a-z]+|[A-Z][a-z]+\s+[A-Z][a-z]+,\s+M\.?D\.?"
         )
@@ -66,16 +64,123 @@ class MedicalRecordPageClustering:
         ]
 
         lines = text.split("\n")
-        headers = []
-        for i in range(min(5, len(lines))):
-            if len(lines[i].strip()) > 3 and len(lines[i].strip()) < 50:
-                headers.append(lines[i].strip())
+
+        best_header_candidate = None
+        candidate_priority = 0  # Higher is better
+
+        # Define prioritized keywords/patterns
+        # Priority 1: Exact, critical section titles (case-insensitive start)
+        p1_keywords = [
+            "labs",
+            "progress notes",
+            "medications",
+            "allergies",
+            "chief complaint",
+            "assessment",
+            "plan",
+            "patient instructions",
+            "discharge summary",
+            "operative report",
+            "consultation report",
+            "history and physical",
+            "radiology report",
+            "pathology report",
+            "operative note",
+        ]
+        # Priority 2: ALL CAPS general titles with common report/note words
+        p2_keywords = [
+            "REPORT",
+            "NOTE",
+            "SUMMARY",
+            "RESULTS",
+            "EXAMINATION",
+            "STUDY",
+            "FINDINGS",
+            "ASSESSMENT",
+            "IMPRESSION",
+        ]
+        # Priority 3: Title Case general titles (less emphasis than P2)
+        p3_keywords = [kw.lower() for kw in p2_keywords]
+        # Priority 4: "(continued)" lines (only if their base matches a known good title, handled by similarity later)
+        # For now, we just want to identify if it *is* a continued line to give it lower priority than specific titles found on same page.
+
+        for i in range(min(20, len(lines))):  # Scan first 20 lines
+            line_text = lines[i].strip()
+            if not line_text or len(line_text) > 100:  # Skip empty or very long lines
+                continue
+
+            line_lower = line_text.lower()
+            words_in_line = line_text.split()
+            num_words = len(words_in_line)
+
+            # Check Priority 1 (Most Specific)
+            for kw in p1_keywords:
+                if (
+                    line_lower.startswith(kw) and num_words <= 5
+                ):  # Starts with specific title, short
+                    if candidate_priority < 5:
+                        best_header_candidate = line_text
+                        candidate_priority = 5
+                    break  # Found P1 match for this line
+            if candidate_priority == 5:
+                continue  # Move to next line if P1 found for this line
+
+            # Check Priority 2 (ALL CAPS General Title)
+            if line_text.isupper() and 1 <= num_words <= 5:
+                for kw_caps in p2_keywords:
+                    if (
+                        kw_caps in line_text
+                    ):  # No need for line_text.upper() as it's already upper
+                        if candidate_priority < 4:
+                            best_header_candidate = line_text
+                            candidate_priority = 4
+                        break
+            if candidate_priority == 4:
+                continue
+
+            # Check Priority 3 (Title Case General Title)
+            # Check if first word is capitalized (simple title case check)
+            if (
+                num_words > 0
+                and words_in_line[0][0].isupper()
+                and not line_text.isupper()
+                and 1 <= num_words <= 6
+            ):
+                for kw_title in p3_keywords:
+                    if kw_title in line_lower:
+                        if candidate_priority < 3:
+                            best_header_candidate = line_text
+                            candidate_priority = 3
+                        break
+            if candidate_priority == 3:
+                continue
+
+            # Check Priority 4 (Continued lines - identified to be de-prioritized if other candidates exist)
+            if "(continued)" in line_lower and num_words <= 5:
+                if candidate_priority < 2:
+                    best_header_candidate = line_text
+                    candidate_priority = 2
+                # Do not break or continue, a more specific title might follow on a later line in the scan range
+
+        extracted_headers = []
+        if best_header_candidate:
+            extracted_headers.append(best_header_candidate)
+        else:  # Fallback to the very first non-empty, reasonably short line
+            for line_content in lines[
+                : min(5, len(lines))
+            ]:  # Check first 5 lines for any content
+                cleaned_line = line_content.strip()
+                if cleaned_line and len(cleaned_line) < 70:  # Reasonably short
+                    extracted_headers.append(cleaned_line)
+                    break
+            if not extracted_headers:  # If truly nothing useful found
+                extracted_headers.append("Unknown Header")
 
         return {
             "dates": dates,
             "providers": providers,
             "facilities": facilities,
-            "headers": headers,
+            "headers": extracted_headers,
         }
 
     def extract_page_features(self):
@@ -86,7 +191,11 @@ class MedicalRecordPageClustering:
             text = page_data["text"]
 
             entities = self.extract_medical_entities(text)
-            doc_type = self.identify_document_type(text)
+            # Use the primary extracted header for document type identification if available
+            primary_header = entities["headers"][0] if entities["headers"] else ""
+            doc_type = self.identify_document_type(
+                text, primary_header
+            )  # Pass both text and header
             structure_features = self.extract_structure_features(text)
 
             self.page_features[page_num] = {
@@ -98,22 +207,32 @@ class MedicalRecordPageClustering:
 
         return self.page_features
 
-    def identify_document_type(self, text):
-        text = text.lower()
+    def identify_document_type(self, text, primary_header=""):
+        text_to_check = text.lower()
 
         doc_types = {
             "lab": [
                 "laboratory",
                 "lab report",
+                "lab results",
                 "test results",
                 "chemistry",
                 "hematology",
+                "pathology report",
+                "blood work",
+                "report of laboratory examination",
+                "laboratory findings",
             ],
             "progress": [
                 "progress note",
                 "office visit",
                 "progress report",
                 "clinical note",
+                "physician's notes",
+                "physician's progress note",
+                "clinic visit",
+                "follow-up note",
+                "soap note",
             ],
             "discharge": [
                 "discharge summary",
@@ -125,9 +244,22 @@ class MedicalRecordPageClustering:
             "consultation": ["consultation", "referral", "consult"],
         }
 
+        first_few_lines_text = text_to_check[:150]
+
         for doc_type, keywords in doc_types.items():
             for keyword in keywords:
-                if keyword in text:
+                if keyword in first_few_lines_text:
+                    if (
+                        len(keyword.split()) > 1
+                        and keyword in first_few_lines_text.split("\n")[0]
+                    ):
+                        return doc_type
+                    if keyword in first_few_lines_text:
+                        return doc_type
+
+        for doc_type, keywords in doc_types.items():
+            for keyword in keywords:
+                if keyword in text_to_check:
                     return doc_type
 
         return "unknown"
@@ -179,26 +311,47 @@ class MedicalRecordPageClustering:
 
                 text_sim = text_similarities[i, j]
 
-                doc_type_sim = (
-                    1.0
-                    if self.page_features[pi]["doc_type"]
-                    == self.page_features[pj]["doc_type"]
-                    else 0.0
-                )
+                doc_type_pi = self.page_features[pi]["doc_type"]
+                doc_type_pj = self.page_features[pj]["doc_type"]
+
+                if doc_type_pi == doc_type_pj:
+                    if doc_type_pi == "unknown":
+                        doc_type_sim = 0.5  # Reduced similarity for two 'unknown' types
+                    else:
+                        doc_type_sim = (
+                            1.0  # Strong similarity for two matching known types
+                        )
+                else:
+                    doc_type_sim = 0.0  # No similarity for different types
 
                 header_sim = self.compute_header_similarity(
                     self.page_features[pi]["entities"]["headers"],
                     self.page_features[pj]["entities"]["headers"],
                 )
 
-                page_continuity = 1.0 if abs(pi - pj) == 1 else 0.0
+                # Consider similarity only for adjacent pages for the clustering logic that iterates sequentially
+                # However, the full matrix might be useful for other clustering approaches. For now, focus on pi == pj or abs(pi-pj)==1
+                # The current clustering logic in cluster_pages only uses similarity_matrix[j, j + 1]
+                # So, this full matrix calculation is more general than strictly needed by cluster_pages, but good for potential future use.
+
+                page_continuity = 0.0
+                if abs(pi - pj) == 1:  # Check for direct adjacency
+                    page_continuity = 1.0
+                elif pi == pj:  # Page compared to itself
+                    page_continuity = 1.0  # Or based on self-similarity aspects, but usually text_sim is 1 for self.
 
                 similarity_matrix[i, j] = (
-                    0.5 * text_sim
+                    0.4 * text_sim
                     + 0.2 * doc_type_sim
-                    + 0.2 * header_sim
+                    + 0.3 * header_sim
                     + 0.1 * page_continuity
                 )
+                if (
+                    pi == pj
+                ):  # Ensure self-similarity is high, mainly driven by text_sim being 1.
+                    similarity_matrix[i, j] = max(
+                        similarity_matrix[i, j], text_sim, 1.0
+                    )  # Ensure self is 1.0
 
         return similarity_matrix, page_nums
 
@@ -207,20 +360,33 @@ class MedicalRecordPageClustering:
             return 0.0
 
         max_sim = 0.0
-        for h1 in headers1:
-            for h2 in headers2:
-                words1 = set(h1.lower().split())
-                words2 = set(h2.lower().split())
+        for h1_orig in headers1:
+            for h2_orig in headers2:
+                h1 = h1_orig.lower().strip()
+                h2 = h2_orig.lower().strip()
+
+                # Check for "(continued)" pattern for strong match
+                h1_base = re.sub(r"\s*\(continued\)\s*$", "", h1).strip()
+                h2_base = re.sub(r"\s*\(continued\)\s*$", "", h2).strip()
+
+                # If base headers are identical and one or both are continuations, or if original headers are identical
+                if h1_base == h2_base and (
+                    h1.endswith("(continued)") or h2.endswith("(continued)") or h1 == h2
+                ):
+                    return 1.0  # Perfect match
+
+                # Fallback to word-based similarity if not a direct continuation match
+                words1 = set(h1.split())
+                words2 = set(h2.split())
 
                 if not words1 or not words2:
-                    continue
+                    continue  # Skip if one header is empty after processing
 
                 intersection = len(words1.intersection(words2))
                 union = len(words1.union(words2))
 
                 sim = intersection / union if union > 0 else 0
                 max_sim = max(max_sim, sim)
-
         return max_sim
 
     def cluster_pages(self, threshold=0.6):
@@ -240,14 +406,35 @@ class MedicalRecordPageClustering:
             current_cluster = [page_nums[i]]
             assigned_pages.add(page_nums[i])
 
-            j = i
-            while j < n_pages - 1:
-                if similarity_matrix[j, j + 1] >= threshold:
-                    current_cluster.append(page_nums[j + 1])
-                    assigned_pages.add(page_nums[j + 1])
-                    j += 1
+            # current_matrix_idx is the index in similarity_matrix and page_nums for the last page added
+            current_matrix_idx = i
+            while current_matrix_idx < n_pages - 1:
+                page_current_num = page_nums[current_matrix_idx]
+                page_next_num = page_nums[current_matrix_idx + 1]
+
+                doc_type_current = self.page_features[page_current_num]["doc_type"]
+                doc_type_next = self.page_features[page_next_num]["doc_type"]
+
+                force_break = False
+                if (
+                    doc_type_current != "unknown"
+                    and doc_type_next != "unknown"
+                    and doc_type_current != doc_type_next
+                ):
+                    force_break = True
+
+                if (
+                    not force_break
+                    and similarity_matrix[current_matrix_idx, current_matrix_idx + 1]
+                    >= threshold
+                ):
+                    current_cluster.append(page_next_num)
+                    assigned_pages.add(page_next_num)
+                    current_matrix_idx += (
+                        1  # Move to the newly added page to check for the next one
+                    )
                 else:
-                    break
+                    break  # Break due to forced condition or low similarity
 
             clusters[cluster_id] = current_cluster
             cluster_id += 1
@@ -264,21 +451,47 @@ class MedicalRecordPageClustering:
             "category": None,
         }
 
-        all_dates = []
         all_providers = []
         all_facilities = []
-        all_headers = []
+        all_headers_from_all_pages = []
+        doc_types_in_cluster = []
 
+        if cluster:
+            first_page_num = cluster[0]
+            first_page_features = self.page_features.get(first_page_num)
+
+            if first_page_features:
+                first_page_dates = first_page_features["entities"]["dates"]
+                if first_page_dates:
+                    metadata["dos"] = max(
+                        set(first_page_dates), key=first_page_dates.count
+                    )
+
+                if first_page_features["entities"]["headers"]:
+                    metadata["header"] = first_page_features["entities"]["headers"][0]
+
+        all_dates_overall = []
         for page_num in cluster:
-            page_data = self.page_features[page_num]
+            page_data = self.page_features.get(page_num)
+            if not page_data:
+                continue
 
-            all_dates.extend(page_data["entities"]["dates"])
+            all_dates_overall.extend(page_data["entities"]["dates"])
             all_providers.extend(page_data["entities"]["providers"])
             all_facilities.extend(page_data["entities"]["facilities"])
-            all_headers.extend(page_data["entities"]["headers"])
+            if page_data["entities"]["headers"]:
+                all_headers_from_all_pages.extend(page_data["entities"]["headers"])
+            doc_types_in_cluster.append(page_data["doc_type"])
 
-        if all_dates:
-            metadata["dos"] = max(set(all_dates), key=all_dates.count)
+        if not metadata["dos"] and all_dates_overall:
+            metadata["dos"] = max(set(all_dates_overall), key=all_dates_overall.count)
+
+        if not metadata["header"] and all_headers_from_all_pages:
+            metadata["header"] = max(
+                set(all_headers_from_all_pages), key=all_headers_from_all_pages.count
+            )
+        elif not metadata["header"]:
+            metadata["header"] = "Unknown Header"
 
         if all_providers:
             metadata["provider"] = max(set(all_providers), key=all_providers.count)
@@ -286,13 +499,10 @@ class MedicalRecordPageClustering:
         if all_facilities:
             metadata["facility"] = max(set(all_facilities), key=all_facilities.count)
 
-        if all_headers:
-            metadata["header"] = max(set(all_headers), key=all_headers.count)
-
-        doc_types = [self.page_features[page_num]["doc_type"] for page_num in cluster]
-        if doc_types:
-            most_common_type = max(set(doc_types), key=doc_types.count)
-
+        if doc_types_in_cluster:
+            most_common_type = max(
+                set(doc_types_in_cluster), key=doc_types_in_cluster.count
+            )
             category_map = {
                 "lab": 24,
                 "progress": 16,
@@ -302,8 +512,9 @@ class MedicalRecordPageClustering:
                 "consultation": 15,
                 "unknown": 0,
             }
-
             metadata["category"] = category_map.get(most_common_type, 0)
+        else:
+            metadata["category"] = 0
 
         return metadata
 

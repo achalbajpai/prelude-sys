@@ -125,13 +125,36 @@ class EnhancedMedicalRecordClustering:
             current_cluster = [page_nums[i]]
             assigned_pages.add(page_nums[i])
 
-            # Find connected pages
-            j = i
-            while j < n_pages - 1:
-                if similarity_matrix[j, j + 1] >= threshold:
-                    current_cluster.append(page_nums[j + 1])
-                    assigned_pages.add(page_nums[j + 1])
-                    j += 1
+            # current_matrix_idx is the index in similarity_matrix and page_nums for the last page added
+            current_matrix_idx = i
+            while current_matrix_idx < n_pages - 1:
+                page_current_num = page_nums[current_matrix_idx]
+                page_next_num = page_nums[current_matrix_idx + 1]
+
+                # Access page_features from base_clustering
+                doc_type_current = self.base_clustering.page_features[page_current_num][
+                    "doc_type"
+                ]
+                doc_type_next = self.base_clustering.page_features[page_next_num][
+                    "doc_type"
+                ]
+
+                force_break = False
+                if (
+                    doc_type_current != "unknown"
+                    and doc_type_next != "unknown"
+                    and doc_type_current != doc_type_next
+                ):
+                    force_break = True
+
+                if (
+                    not force_break
+                    and similarity_matrix[current_matrix_idx, current_matrix_idx + 1]
+                    >= threshold
+                ):
+                    current_cluster.append(page_next_num)
+                    assigned_pages.add(page_next_num)
+                    current_matrix_idx += 1
                 else:
                     break
 
